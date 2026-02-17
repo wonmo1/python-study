@@ -1,16 +1,20 @@
 WITH params AS (
-  SELECT now() - interval 365 days AS start_ts,
-         now() AS end_ts
+  SELECT
+    now() - interval 365 days AS start_ts,
+    now() AS end_ts
 ),
 
+-- TEAM + VANTAGE + ROOM5 + CH 포함 station
 team_station AS (
-  SELECT DISTINCT STATION AS station
+  SELECT DISTINCT
+    STATION AS station
   FROM fab.m_tpss_station_master
   WHERE SUBSTR(room, -1) = '5'
     AND STATION_NAME IN ('VANTAGE-PLUS','VANTAGE_PLUS','VANTAGE')
     AND STATION LIKE '%-%'
 ),
 
+-- RS 이벤트 후보 (49/81/121/151 포인트 완성 이벤트만)
 rs_evt AS (
   SELECT
     concat(m.prc_eqp_id, '-', m.chamber_ids) AS station,
@@ -34,6 +38,7 @@ rs_evt AS (
   HAVING count(distinct m.subitem_id) IN (49,81,121,151)
 ),
 
+-- DCOP 키 (OFFSET 존재하는 키만)
 dcop_key AS (
   SELECT DISTINCT
     concat(d.prc_eqp_id, '-', d.chamber_ids) AS station,
@@ -45,6 +50,7 @@ dcop_key AS (
     AND d.item_id LIKE '%OFFSET%'
 ),
 
+-- DCOP 매칭된 RS 이벤트만 남김 (선택 A)
 rs_evt_matched AS (
   SELECT r.*
   FROM rs_evt r
@@ -55,6 +61,7 @@ rs_evt_matched AS (
    AND r.prc_slot_id  = k.prc_slot_id
 ),
 
+-- DCOP 7개 OFFSET 피벗
 dcop_wide AS (
   SELECT
     concat(d.prc_eqp_id, '-', d.chamber_ids) AS station,
@@ -83,6 +90,7 @@ dcop_wide AS (
     d.prc_slot_id
 ),
 
+-- 최종 결합
 final AS (
   SELECT
     r.station,
@@ -101,7 +109,15 @@ final AS (
    AND r.prc_slot_id  = w.prc_slot_id
 )
 
+-- 🔥 NULL 제거 적용
 SELECT *
 FROM final
+WHERE t1 IS NOT NULL
+  AND t2 IS NOT NULL
+  AND t3 IS NOT NULL
+  AND t4 IS NOT NULL
+  AND t5 IS NOT NULL
+  AND t6 IS NOT NULL
+  AND t7 IS NOT NULL
 ORDER BY rs_time DESC
 LIMIT 200;
