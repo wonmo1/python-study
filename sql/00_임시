@@ -1,4 +1,4 @@
-EVENTS_SQL = r"""
+RS_LONG_SQL = r"""
 WITH params AS (
   SELECT
     now() - interval 365 days AS start_ts,
@@ -106,10 +106,9 @@ dcop_wide AS (
     d.npw_wafer_id,
     d.prc_slot_id
 ),
-events AS (
+events_key AS (
   SELECT
     r.station,
-    s.line,
     r.pm_start_ts,
     r.pm_end_ts,
     concat(r.station, '|', cast(r.pm_start_ts as string)) AS pm_session_id,
@@ -118,20 +117,43 @@ events AS (
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
-    r.prc_slot_id,
-    r.n_points,
-    w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, w.t7
+    r.prc_slot_id
   FROM rs_in_pm r
-  JOIN team_station s
-    ON r.station = s.station
   JOIN dcop_wide w
     ON r.station      = w.station
    AND r.container_id = w.container_id
    AND r.npw_wafer_id = w.npw_wafer_id
    AND r.prc_slot_id  = w.prc_slot_id
+  WHERE w.t1 IS NOT NULL AND w.t2 IS NOT NULL AND w.t3 IS NOT NULL
+    AND w.t4 IS NOT NULL AND w.t5 IS NOT NULL AND w.t6 IS NOT NULL AND w.t7 IS NOT NULL
 )
-SELECT *
-FROM events
-WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
-  AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
+SELECT
+  e.station,
+  e.pm_start_ts,
+  e.pm_end_ts,
+  e.pm_session_id,
+  e.prc_ppid,
+  e.test_seq,
+  e.rs_time,
+  e.container_id,
+  e.npw_wafer_id,
+  e.prc_slot_id,
+  m.subitem_id,
+  m.value
+FROM fab.m_fab_npw_met m
+JOIN events_key e
+  ON concat(m.prc_eqp_id, '-', m.chamber_ids) = e.station
+ AND m.prc_tkin_time = e.rs_time
+ AND m.container_id  = e.container_id
+ AND m.npw_wafer_id  = e.npw_wafer_id
+ AND m.prc_slot_id   = e.prc_slot_id
+WHERE m.item_id = 'RS1'
+  AND m.subitem_id RLIKE '^S[0-9]+$'
 """
+
+rs_long_df = getData(RS_LONG_SQL + "\nLIMIT 5000")
+print("rs_long sample rows:", len(rs_long_df))
+print(rs_long_df.head(5))
+
+rs_long_df = add_dt_partition(rs_long_df, ts_col="pm_start_ts", dt_col="dt")
+upload_parquet_by_dt(rs_long_df, dt_col="dt", key_prefix="rs_long_sample")
