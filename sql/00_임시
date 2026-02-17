@@ -1,81 +1,184 @@
-WITH last_pm AS (
-  WITH h AS (
-    SELECT
-      eqp_id,
-      eqp_status,
-      eqp_status_change_time AS t,
-      LEAD(eqp_status, 1) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s1,
-      LEAD(eqp_status_change_time, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS t2,
-      LEAD(eqp_status, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s2
-    FROM mos_kh_smi.smimes_mi_eqp_hist
-    WHERE eqp_id = 'IMRB301-A'
-      AND eqp_status_change_time BETWEEN
-            concat(from_unixtime(unix_timestamp() - 365*24*60*60, 'yyyyMMdd'), ' 000000')
-        AND concat(from_unixtime(unix_timestamp() - 1*24*60*60,  'yyyyMMdd'), ' 235959')
-  )
+WITH params AS (
   SELECT
-    'IMRB301-A' AS station,
-    cast(from_unixtime(unix_timestamp(t,  'yyyyMMdd HHmmss')) as timestamp)  AS pm_start_ts,
-    cast(from_unixtime(unix_timestamp(t2, 'yyyyMMdd HHmmss')) as timestamp) AS pm_end_ts
+    now() - interval 365 days AS start_ts,
+    now() AS end_ts
+),
+
+-- 1) TEAM + VANTAGE + ROOM5 대상 station 목록 (CH 포함 station)
+team_station AS (
+  SELECT DISTINCT
+    STATION AS station
+  FROM fab.m_tpss_station_master
+  WHERE SUBSTR(room, -1) = '5'
+    AND STATION_NAME IN ('VANTAGE-PLUS','VANTAGE_PLUS','VANTAGE')
+    AND STATION LIKE '%-%'
+),
+
+-- 2) smimes에서 상태변경 이력 + 다음 2스텝 미리보기
+h AS (
+  SELECT
+    eqp_id,
+    line_id,
+    origin_line_id,
+    eqp_status,
+    eqp_status_change_time AS t,
+
+    LEAD(eqp_status, 1) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s1,
+    LEAD(eqp_status_change_time, 1) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS t1,
+
+    LEAD(eqp_status, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s2,
+    LEAD(eqp_status_change_time, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS t2
+  FROM mos_kh_smi.smimes_mi_eqp_hist
+  WHERE eqp_id IN (SELECT station FROM team_station)
+    AND eqp_status_change_time BETWEEN
+          concat(from_unixtime(unix_timestamp((SELECT start_ts FROM params)), 'yyyyMMdd'), ' 000000')
+      AND concat(from_unixtime(unix_timestamp((SELECT end_ts   FROM params)), 'yyyyMMdd'), ' 235959')
+),
+
+-- 3) PM 세션 정의: PM-LOCAL-IDLE 또는 PM-LOCAL-RUN, duration 4~10h
+pm AS (
+  SELECT
+    eqp_id AS station,
+    line_id,
+    origin_line_id,
+
+    cast(from_unixtime(unix_timestamp(t,  'yyyyMMdd HHmmss')) as timestamp) AS pm_start_ts,
+    cast(from_unixtime(unix_timestamp(t2, 'yyyyMMdd HHmmss')) as timestamp) AS pm_end_ts,
+
+    unix_timestamp(t2, 'yyyyMMdd HHmmss') - unix_timestamp(t, 'yyyyMMdd HHmmss') AS dur_sec,
+    s2 AS pm_end_status
   FROM h
   WHERE eqp_status = 'PM'
     AND s1 = 'LOCAL'
     AND s2 IN ('IDLE','RUN')
     AND t2 IS NOT NULL
-  ORDER BY t2 DESC
-  LIMIT 1
+),
+pm_filtered AS (
+  SELECT *
+  FROM pm
+  WHERE dur_sec BETWEEN 4*3600 AND 10*3600
 ),
 
+-- 4) RS 이벤트 후보(= RS1 + S숫자 포인트만) → 이벤트 단위로 그룹핑
 rs_evt AS (
   SELECT
-    concat(prc_eqp_id, '-', chamber_ids) AS station,
-    prc_tkin_time AS rs_time,
+    concat(m.prc_eqp_id, '-', m.chamber_ids) AS station,
+    m.prc_tkin_time AS rs_time,
+    m.container_id,
+    m.npw_wafer_id,
+    m.prc_slot_id,
+    m.prc_ppid,
+    count(distinct m.subitem_id) AS n_points
+  FROM fab.m_fab_npw_met m
+  WHERE m.item_id = 'RS1'
+    AND m.subitem_id RLIKE '^S[0-9]+$'
+    AND m.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
+    -- 필요하면 아래 레시피 필터를 사용 (희소하면 0될 수 있음)
+    -- AND m.prc_ppid = 'TT_RA-108030'
+  GROUP BY
+    concat(m.prc_eqp_id, '-', m.chamber_ids),
+    m.prc_tkin_time,
+    m.container_id,
+    m.npw_wafer_id,
+    m.prc_slot_id,
+    m.prc_ppid
+  HAVING count(distinct m.subitem_id) IN (49,81,151)
+),
+
+-- 5) PM 구간 안에 들어가는 RS 이벤트만 남김
+rs_in_pm AS (
+  SELECT
+    p.station,
+    p.line_id,
+    p.origin_line_id,
+    p.pm_start_ts,
+    p.pm_end_ts,
+    p.pm_end_status,
+
+    r.rs_time,
+    r.container_id,
+    r.npw_wafer_id,
+    r.prc_slot_id,
+    r.prc_ppid,
+    r.n_points
+  FROM pm_filtered p
+  JOIN rs_evt r
+    ON r.station = p.station
+   AND r.rs_time BETWEEN p.pm_start_ts AND p.pm_end_ts
+),
+
+-- 6) PM 세션 내 RS test 순번(test_seq) 부여
+rs_event AS (
+  SELECT
+    station,
+    line_id,
+    origin_line_id,
+    pm_start_ts,
+    pm_end_ts,
+    pm_end_status,
+
+    rs_time,
+    row_number() OVER (
+      PARTITION BY station, pm_start_ts, pm_end_ts
+      ORDER BY rs_time, container_id, npw_wafer_id, prc_slot_id
+    ) AS test_seq,
+
     container_id,
     npw_wafer_id,
     prc_slot_id,
     prc_ppid,
-    count(distinct subitem_id) AS n_points
-  FROM fab.m_fab_npw_met m
-  CROSS JOIN last_pm p
-  WHERE m.prc_eqp_id = 'IMRB301'
-    AND m.chamber_ids = 'A'
-    AND m.item_id = 'RS1'
-    AND m.subitem_id RLIKE '^S[0-9]+$'
-    AND m.prc_tkin_time BETWEEN p.pm_start_ts AND p.pm_end_ts
-  GROUP BY
-    concat(prc_eqp_id, '-', chamber_ids),
-    prc_tkin_time, container_id, npw_wafer_id, prc_slot_id, prc_ppid
-  HAVING count(distinct subitem_id) IN (49,81,151)
+    n_points
+  FROM rs_in_pm
 ),
 
+-- 7) DCOP 7행 → t1~t7 피벗 (item_id: A_OFFSET1 형태)
 dcop_wide AS (
   SELECT
-    concat(prc_eqp_id, '-', chamber_ids) AS station,
-    container_id,
-    npw_wafer_id,
-    prc_slot_id,
-    max(case when item_id like '%_OFFSET1' then value end) as t1,
-    max(case when item_id like '%_OFFSET2' then value end) as t2,
-    max(case when item_id like '%_OFFSET3' then value end) as t3,
-    max(case when item_id like '%_OFFSET4' then value end) as t4,
-    max(case when item_id like '%_OFFSET5' then value end) as t5,
-    max(case when item_id like '%_OFFSET6' then value end) as t6,
-    max(case when item_id like '%_OFFSET7' then value end) as t7
+    concat(d.prc_eqp_id, '-', d.chamber_ids) AS station,
+    d.container_id,
+    d.npw_wafer_id,
+    d.prc_slot_id,
+
+    max(case when d.item_id like '%_OFFSET1' then d.value end) as t1,
+    max(case when d.item_id like '%_OFFSET2' then d.value end) as t2,
+    max(case when d.item_id like '%_OFFSET3' then d.value end) as t3,
+    max(case when d.item_id like '%_OFFSET4' then d.value end) as t4,
+    max(case when d.item_id like '%_OFFSET5' then d.value end) as t5,
+    max(case when d.item_id like '%_OFFSET6' then d.value end) as t6,
+    max(case when d.item_id like '%_OFFSET7' then d.value end) as t7
   FROM fab.m_fab_npw_dcop d
-  WHERE d.prc_eqp_id = 'IMRB301'
-    AND d.chamber_ids = 'A'
+  WHERE d.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
     AND d.item_id RLIKE '^[A-Z]_OFFSET[1-7]$'
   GROUP BY
-    concat(prc_eqp_id, '-', chamber_ids),
-    container_id, npw_wafer_id, prc_slot_id
+    concat(d.prc_eqp_id, '-', d.chamber_ids),
+    d.container_id,
+    d.npw_wafer_id,
+    d.prc_slot_id
 )
 
+-- 8) 최종: RS 이벤트 + DCOP 조인
 SELECT
-  COUNT(*) AS rs_evt_cnt,
-  SUM(CASE WHEN w.t1 IS NOT NULL THEN 1 ELSE 0 END) AS joined_cnt
-FROM rs_evt r
+  e.station,
+  e.line_id,
+  e.origin_line_id,
+  e.pm_start_ts,
+  e.pm_end_ts,
+  e.pm_end_status,
+  e.test_seq,
+  e.rs_time,
+
+  e.container_id,
+  e.npw_wafer_id,
+  e.prc_slot_id,
+  e.prc_ppid,
+  e.n_points,
+
+  w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, w.t7
+FROM rs_event e
 LEFT JOIN dcop_wide w
-  ON r.station = w.station
- AND r.container_id = w.container_id
- AND r.npw_wafer_id = w.npw_wafer_id
- AND r.prc_slot_id  = w.prc_slot_id;
+  ON e.station      = w.station
+ AND e.container_id = w.container_id
+ AND e.npw_wafer_id = w.npw_wafer_id
+ AND e.prc_slot_id  = w.prc_slot_id
+ORDER BY e.rs_time DESC
+LIMIT 2000;
