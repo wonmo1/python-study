@@ -4,17 +4,52 @@ WITH params AS (
     now() AS end_ts
 ),
 
--- TEAM + VANTAGE + ROOM5 + CH 포함 station
+-- 우리 범위의 VANTAGE station(챔버 포함) + line(area)
 team_station AS (
   SELECT DISTINCT
-    STATION AS station
-  FROM fab.m_tpss_station_master
-  WHERE SUBSTR(room, -1) = '5'
-    AND STATION_NAME IN ('VANTAGE-PLUS','VANTAGE_PLUS','VANTAGE')
-    AND STATION LIKE '%-%'
+    m.STATION AS station,
+    m.area    AS line
+  FROM fab.m_tpss_station_master m
+  WHERE SUBSTR(m.room, -1) = '5'
+    AND m.STATION_NAME IN ('VANTAGE-PLUS','VANTAGE_PLUS','VANTAGE')
+    AND m.STATION LIKE '%-%'
 ),
 
--- RS 이벤트 후보 (49/81/121/151 포인트 완성 이벤트만)
+/* PM 세션 정의: PM -> LOCAL -> (IDLE or RUN)
+   pm_start_time = PM 입력시간
+   pm_end_time   = IDLE/RUN 입력시간
+   duration      = 4~10시간만
+*/
+h AS (
+  SELECT
+    eqp_id,
+    eqp_status,
+    eqp_status_change_time AS t,
+
+    LEAD(eqp_status, 1) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s1,
+    LEAD(eqp_status_change_time, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS t2,
+    LEAD(eqp_status, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s2
+  FROM mos_kh_smi.smimes_mi_eqp_hist
+  WHERE eqp_id IN (SELECT station FROM team_station)
+    AND eqp_status_change_time BETWEEN
+          concat(from_unixtime(unix_timestamp((SELECT start_ts FROM params)), 'yyyyMMdd'), ' 000000')
+      AND concat(from_unixtime(unix_timestamp((SELECT end_ts   FROM params)), 'yyyyMMdd'), ' 235959')
+),
+
+pm_session AS (
+  SELECT
+    eqp_id AS station,
+    cast(from_unixtime(unix_timestamp(t,  'yyyyMMdd HHmmss')) as timestamp) AS pm_start_ts,
+    cast(from_unixtime(unix_timestamp(t2, 'yyyyMMdd HHmmss')) as timestamp) AS pm_end_ts
+  FROM h
+  WHERE eqp_status = 'PM'
+    AND s1 = 'LOCAL'
+    AND s2 IN ('IDLE','RUN')
+    AND t2 IS NOT NULL
+    AND (unix_timestamp(t2, 'yyyyMMdd HHmmss') - unix_timestamp(t, 'yyyyMMdd HHmmss')) BETWEEN 4*3600 AND 10*3600
+),
+
+-- RS 이벤트(완성된 포인트만): 49/81/121/151
 rs_evt AS (
   SELECT
     concat(m.prc_eqp_id, '-', m.chamber_ids) AS station,
@@ -38,27 +73,26 @@ rs_evt AS (
   HAVING count(distinct m.subitem_id) IN (49,81,121,151)
 ),
 
--- DCOP 키 (OFFSET 존재하는 키만)
-dcop_key AS (
-  SELECT DISTINCT
-    concat(d.prc_eqp_id, '-', d.chamber_ids) AS station,
-    d.container_id,
-    d.npw_wafer_id,
-    d.prc_slot_id
-  FROM fab.m_fab_npw_dcop d
-  WHERE d.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
-    AND d.item_id LIKE '%OFFSET%'
-),
-
--- DCOP 매칭된 RS 이벤트만 남김 (선택 A)
-rs_evt_matched AS (
-  SELECT r.*
-  FROM rs_evt r
-  JOIN dcop_key k
-    ON r.station      = k.station
-   AND r.container_id = k.container_id
-   AND r.npw_wafer_id = k.npw_wafer_id
-   AND r.prc_slot_id  = k.prc_slot_id
+-- PM 세션 구간 안에 들어온 RS만 남김 + test_seq 부여
+rs_in_pm AS (
+  SELECT
+    p.station,
+    p.pm_start_ts,
+    p.pm_end_ts,
+    r.rs_time,
+    r.container_id,
+    r.npw_wafer_id,
+    r.prc_slot_id,
+    r.prc_ppid,
+    r.n_points,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.station, p.pm_start_ts, p.pm_end_ts
+      ORDER BY r.rs_time
+    ) AS test_seq
+  FROM pm_session p
+  JOIN rs_evt r
+    ON r.station = p.station
+   AND r.rs_time BETWEEN p.pm_start_ts AND p.pm_end_ts
 ),
 
 -- DCOP 7개 OFFSET 피벗
@@ -90,18 +124,25 @@ dcop_wide AS (
     d.prc_slot_id
 ),
 
--- 최종 결합
-final AS (
+events AS (
   SELECT
     r.station,
+    s.line,
+    r.pm_start_ts,
+    r.pm_end_ts,
+    r.test_seq,
+
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
     r.prc_slot_id,
     r.prc_ppid,
     r.n_points,
+
     w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, w.t7
-  FROM rs_evt_matched r
+  FROM rs_in_pm r
+  JOIN team_station s
+    ON r.station = s.station
   JOIN dcop_wide w
     ON r.station      = w.station
    AND r.container_id = w.container_id
@@ -109,15 +150,9 @@ final AS (
    AND r.prc_slot_id  = w.prc_slot_id
 )
 
--- 🔥 NULL 제거 적용
 SELECT *
-FROM final
-WHERE t1 IS NOT NULL
-  AND t2 IS NOT NULL
-  AND t3 IS NOT NULL
-  AND t4 IS NOT NULL
-  AND t5 IS NOT NULL
-  AND t6 IS NOT NULL
-  AND t7 IS NOT NULL
+FROM events
+WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
+  AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
 ORDER BY rs_time DESC
 LIMIT 200;
