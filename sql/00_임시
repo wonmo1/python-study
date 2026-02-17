@@ -83,9 +83,10 @@ final AS (
 )
 SELECT
   prc_ppid,
-  COUNT(*) AS null_cnt
+  COUNT(*) AS total_cnt,
+  SUM(CASE WHEN t1 IS NULL THEN 1 ELSE 0 END) AS null_cnt,
+  ROUND(100.0 * SUM(CASE WHEN t1 IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2) AS null_rate_pct
 FROM final
-WHERE t1 IS NULL
 GROUP BY prc_ppid
-ORDER BY null_cnt DESC
+ORDER BY null_rate_pct DESC, total_cnt DESC
 LIMIT 100;
