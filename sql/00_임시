@@ -1,10 +1,9 @@
+EVENTS_SQL = r"""
 WITH params AS (
   SELECT
     now() - interval 365 days AS start_ts,
     now() AS end_ts
 ),
-
--- 우리 범위의 VANTAGE station(챔버 포함) + line(area)
 team_station AS (
   SELECT DISTINCT
     m.STATION AS station,
@@ -14,16 +13,11 @@ team_station AS (
     AND m.STATION_NAME IN ('VANTAGE-PLUS','VANTAGE_PLUS','VANTAGE')
     AND m.STATION LIKE '%-%'
 ),
-
-/* PM 세션 정의: PM -> LOCAL -> (IDLE or RUN)
-   duration: 4~10시간
-*/
 h AS (
   SELECT
     eqp_id,
     eqp_status,
     eqp_status_change_time AS t,
-
     LEAD(eqp_status, 1) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s1,
     LEAD(eqp_status_change_time, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS t2,
     LEAD(eqp_status, 2) OVER (PARTITION BY eqp_id ORDER BY eqp_status_change_time) AS s2
@@ -33,7 +27,6 @@ h AS (
           concat(from_unixtime(unix_timestamp((SELECT start_ts FROM params)), 'yyyyMMdd'), ' 000000')
       AND concat(from_unixtime(unix_timestamp((SELECT end_ts   FROM params)), 'yyyyMMdd'), ' 235959')
 ),
-
 pm_session AS (
   SELECT
     eqp_id AS station,
@@ -46,8 +39,6 @@ pm_session AS (
     AND t2 IS NOT NULL
     AND (unix_timestamp(t2, 'yyyyMMdd HHmmss') - unix_timestamp(t, 'yyyyMMdd HHmmss')) BETWEEN 4*3600 AND 10*3600
 ),
-
--- RS 이벤트(완성 포인트만): 49/81/121/151
 rs_evt AS (
   SELECT
     concat(m.prc_eqp_id, '-', m.chamber_ids) AS station,
@@ -70,21 +61,17 @@ rs_evt AS (
     m.prc_ppid
   HAVING count(distinct m.subitem_id) IN (49,81,121,151)
 ),
-
--- PM 세션 구간 안 RS + 레시피별 test_seq
 rs_in_pm AS (
   SELECT
     p.station,
     p.pm_start_ts,
     p.pm_end_ts,
-
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
     r.prc_slot_id,
     r.prc_ppid,
     r.n_points,
-
     DENSE_RANK() OVER (
       PARTITION BY p.station, p.pm_start_ts, p.pm_end_ts, r.prc_ppid
       ORDER BY r.rs_time
@@ -94,15 +81,12 @@ rs_in_pm AS (
     ON r.station = p.station
    AND r.rs_time BETWEEN p.pm_start_ts AND p.pm_end_ts
 ),
-
--- DCOP 7개 OFFSET 피벗
 dcop_wide AS (
   SELECT
     concat(d.prc_eqp_id, '-', d.chamber_ids) AS station,
     d.container_id,
     d.npw_wafer_id,
     d.prc_slot_id,
-
     max(case when d.item_id IN (concat(d.chamber_ids,'_OFFSET1'), concat(d.chamber_ids,'_T1_OFFSET')) then d.value end) as t1,
     max(case when d.item_id IN (concat(d.chamber_ids,'_OFFSET2'), concat(d.chamber_ids,'_T2_OFFSET')) then d.value end) as t2,
     max(case when d.item_id IN (concat(d.chamber_ids,'_OFFSET3'), concat(d.chamber_ids,'_T3_OFFSET')) then d.value end) as t3,
@@ -110,7 +94,6 @@ dcop_wide AS (
     max(case when d.item_id IN (concat(d.chamber_ids,'_OFFSET5'), concat(d.chamber_ids,'_T5_OFFSET')) then d.value end) as t5,
     max(case when d.item_id IN (concat(d.chamber_ids,'_OFFSET6'), concat(d.chamber_ids,'_T6_OFFSET')) then d.value end) as t6,
     max(case when d.item_id IN (concat(d.chamber_ids,'_OFFSET7'), concat(d.chamber_ids,'_T7_OFFSET')) then d.value end) as t7
-
   FROM fab.m_fab_npw_dcop d
   WHERE d.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
     AND (
@@ -123,57 +106,32 @@ dcop_wide AS (
     d.npw_wafer_id,
     d.prc_slot_id
 ),
-
--- ✅ events(정합성 통과한 이벤트만) 키 테이블
 events AS (
   SELECT
     r.station,
+    s.line,
     r.pm_start_ts,
     r.pm_end_ts,
     concat(r.station, '|', cast(r.pm_start_ts as string)) AS pm_session_id,
-
     r.prc_ppid,
     r.test_seq,
-
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
-    r.prc_slot_id
+    r.prc_slot_id,
+    r.n_points,
+    w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, w.t7
   FROM rs_in_pm r
+  JOIN team_station s
+    ON r.station = s.station
   JOIN dcop_wide w
     ON r.station      = w.station
    AND r.container_id = w.container_id
    AND r.npw_wafer_id = w.npw_wafer_id
    AND r.prc_slot_id  = w.prc_slot_id
-  WHERE w.t1 IS NOT NULL AND w.t2 IS NOT NULL AND w.t3 IS NOT NULL
-    AND w.t4 IS NOT NULL AND w.t5 IS NOT NULL AND w.t6 IS NOT NULL AND w.t7 IS NOT NULL
 )
-
--- ✅ rs_long: events에 포함된 이벤트의 RS 포인트만 가져오기
-SELECT
-  e.station,
-  e.pm_start_ts,
-  e.pm_end_ts,
-  e.pm_session_id,
-
-  e.prc_ppid,
-  e.test_seq,
-
-  e.rs_time,
-  e.container_id,
-  e.npw_wafer_id,
-  e.prc_slot_id,
-
-  m.subitem_id,
-  m.value
-FROM fab.m_fab_npw_met m
-JOIN events e
-  ON concat(m.prc_eqp_id, '-', m.chamber_ids) = e.station
- AND m.prc_tkin_time = e.rs_time
- AND m.container_id  = e.container_id
- And m.npw_wafer_id  = e.npw_wafer_id
- AND m.prc_slot_id   = e.prc_slot_id
-WHERE m.item_id = 'RS1'
-  AND m.subitem_id RLIKE '^S[0-9]+$'
-ORDER BY e.pm_start_ts DESC, e.station, e.prc_ppid, e.test_seq, e.rs_time, m.subitem_id
-LIMIT 500;
+SELECT *
+FROM events
+WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
+  AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
+"""
