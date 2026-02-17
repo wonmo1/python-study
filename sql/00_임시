@@ -71,7 +71,7 @@ rs_evt AS (
   HAVING count(distinct m.subitem_id) IN (49,81,121,151)
 ),
 
--- ✅ PM 세션 구간 안 RS + 레시피별 test_seq (같은 rs_time+같은 prc_ppid면 같은 회차)
+-- PM 세션 구간 안 RS + 레시피별 test_seq
 rs_in_pm AS (
   SELECT
     p.station,
@@ -124,14 +124,12 @@ dcop_wide AS (
     d.prc_slot_id
 ),
 
+-- ✅ events(정합성 통과한 이벤트만) 키 테이블
 events AS (
   SELECT
     r.station,
-    s.line,
-
     r.pm_start_ts,
     r.pm_end_ts,
-
     concat(r.station, '|', cast(r.pm_start_ts as string)) AS pm_session_id,
 
     r.prc_ppid,
@@ -140,23 +138,42 @@ events AS (
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
-    r.prc_slot_id,
-    r.n_points,
-
-    w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, w.t7
+    r.prc_slot_id
   FROM rs_in_pm r
-  JOIN team_station s
-    ON r.station = s.station
   JOIN dcop_wide w
     ON r.station      = w.station
    AND r.container_id = w.container_id
    AND r.npw_wafer_id = w.npw_wafer_id
    AND r.prc_slot_id  = w.prc_slot_id
+  WHERE w.t1 IS NOT NULL AND w.t2 IS NOT NULL AND w.t3 IS NOT NULL
+    AND w.t4 IS NOT NULL AND w.t5 IS NOT NULL AND w.t6 IS NOT NULL AND w.t7 IS NOT NULL
 )
 
-SELECT *
-FROM events
-WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
-  AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
-ORDER BY pm_start_ts DESC, station, prc_ppid, test_seq, rs_time
-LIMIT 200;
+-- ✅ rs_long: events에 포함된 이벤트의 RS 포인트만 가져오기
+SELECT
+  e.station,
+  e.pm_start_ts,
+  e.pm_end_ts,
+  e.pm_session_id,
+
+  e.prc_ppid,
+  e.test_seq,
+
+  e.rs_time,
+  e.container_id,
+  e.npw_wafer_id,
+  e.prc_slot_id,
+
+  m.subitem_id,
+  m.value
+FROM fab.m_fab_npw_met m
+JOIN events e
+  ON concat(m.prc_eqp_id, '-', m.chamber_ids) = e.station
+ AND m.prc_tkin_time = e.rs_time
+ AND m.container_id  = e.container_id
+ And m.npw_wafer_id  = e.npw_wafer_id
+ AND m.prc_slot_id   = e.prc_slot_id
+WHERE m.item_id = 'RS1'
+  AND m.subitem_id RLIKE '^S[0-9]+$'
+ORDER BY e.pm_start_ts DESC, e.station, e.prc_ppid, e.test_seq, e.rs_time, m.subitem_id
+LIMIT 500;
