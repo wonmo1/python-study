@@ -71,7 +71,7 @@ rs_evt AS (
   HAVING count(distinct m.subitem_id) IN (49,81,121,151)
 ),
 
--- PM 세션 구간 안 RS + test_seq
+-- ✅ PM 세션 구간 안 RS + 레시피별 test_seq (같은 rs_time+같은 prc_ppid면 같은 회차)
 rs_in_pm AS (
   SELECT
     p.station,
@@ -85,8 +85,8 @@ rs_in_pm AS (
     r.prc_ppid,
     r.n_points,
 
-    ROW_NUMBER() OVER (
-      PARTITION BY p.station, p.pm_start_ts, p.pm_end_ts
+    DENSE_RANK() OVER (
+      PARTITION BY p.station, p.pm_start_ts, p.pm_end_ts, r.prc_ppid
       ORDER BY r.rs_time
     ) AS test_seq
   FROM pm_session p
@@ -132,16 +132,15 @@ events AS (
     r.pm_start_ts,
     r.pm_end_ts,
 
-    -- ✅ pm_session_id (station + pm_start_ts)
     concat(r.station, '|', cast(r.pm_start_ts as string)) AS pm_session_id,
 
+    r.prc_ppid,
     r.test_seq,
 
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
     r.prc_slot_id,
-    r.prc_ppid,
     r.n_points,
 
     w.t1, w.t2, w.t3, w.t4, w.t5, w.t6, w.t7
@@ -159,5 +158,5 @@ SELECT *
 FROM events
 WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
   AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
-ORDER BY pm_start_ts DESC, station, test_seq
+ORDER BY pm_start_ts DESC, station, prc_ppid, test_seq, rs_time
 LIMIT 200;
