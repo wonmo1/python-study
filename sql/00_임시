@@ -1,4 +1,3 @@
--- NULL 행 키 샘플 20건
 WITH params AS (
   SELECT now() - interval 365 days AS start_ts, now() AS end_ts
 ),
@@ -40,17 +39,21 @@ rs_evt AS (
     m.container_id,
     m.npw_wafer_id,
     m.prc_slot_id,
+    m.prc_ppid,
     count(distinct m.subitem_id) AS n_points
   FROM fab.m_fab_npw_met m
   WHERE m.item_id = 'RS1'
     AND m.subitem_id RLIKE '^S[0-9]+$'
     AND m.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
-  GROUP BY concat(m.prc_eqp_id, '-', m.chamber_ids), m.prc_tkin_time, m.container_id, m.npw_wafer_id, m.prc_slot_id
+  GROUP BY
+    concat(m.prc_eqp_id, '-', m.chamber_ids),
+    m.prc_tkin_time, m.container_id, m.npw_wafer_id, m.prc_slot_id, m.prc_ppid
   HAVING count(distinct m.subitem_id) IN (49,81,151)
 ),
 rs_event AS (
-  SELECT p.station, p.pm_start_ts, p.pm_end_ts,
-         r.rs_time, r.container_id, r.npw_wafer_id, r.prc_slot_id, r.n_points
+  SELECT
+    p.station, p.pm_start_ts, p.pm_end_ts,
+    r.rs_time, r.container_id, r.npw_wafer_id, r.prc_slot_id, r.prc_ppid, r.n_points
   FROM pm_filtered p
   JOIN rs_evt r
     ON r.station = p.station
@@ -68,11 +71,21 @@ dcop_wide AS (
       OR d.item_id RLIKE '^[A-Z]_T[1-7]_OFFSET$'
     )
   GROUP BY concat(d.prc_eqp_id, '-', d.chamber_ids), d.container_id, d.npw_wafer_id, d.prc_slot_id
+),
+final AS (
+  SELECT e.*, w.t1
+  FROM rs_event e
+  LEFT JOIN dcop_wide w
+    ON e.station=w.station
+   AND e.container_id=w.container_id
+   AND e.npw_wafer_id=w.npw_wafer_id
+   AND e.prc_slot_id=w.prc_slot_id
 )
 SELECT
-  e.station, e.rs_time, e.container_id, e.npw_wafer_id, e.prc_slot_id, e.n_points
-FROM rs_event e
-LEFT JOIN dcop_wide w
-  ON e.station=w.station AND e.container_id=w.container_id AND e.npw_wafer_id=w.npw_wafer_id AND e.prc_slot_id=w.prc_slot_id
-WHERE w.t1 IS NULL
-LIMIT 20;
+  prc_ppid,
+  COUNT(*) AS null_cnt
+FROM final
+WHERE t1 IS NULL
+GROUP BY prc_ppid
+ORDER BY null_cnt DESC
+LIMIT 100;
