@@ -63,7 +63,7 @@ rs_evt AS (
     met.prc_tkin_time AS rs_time,
     met.prc_ppid,
 
-    -- ✅ 조인키 정규화 버전도 같이 생성
+    -- ✅ 조인키 정규화
     upper(trim(met.container_id))   AS container_id_n,
     upper(trim(met.npw_wafer_id))   AS npw_wafer_id_n,
     cast(met.prc_slot_id as string) AS prc_slot_id_n,
@@ -116,7 +116,6 @@ rs_event AS (
       ORDER BY rs_time, container_id_n, npw_wafer_id_n, prc_slot_id_n
     ) AS test_seq,
 
-    -- ✅ 정규화된 키를 최종 키로 사용
     container_id_n AS container_id,
     npw_wafer_id_n AS npw_wafer_id,
     prc_slot_id_n  AS prc_slot_id,
@@ -126,22 +125,22 @@ rs_event AS (
   FROM rs_in_pm
 ),
 
--- ===== DCOP wide (정규화 적용) =====
+-- ===== DCOP wide (✅ 챔버 동적 매칭 + 정규화) =====
 dcop_wide AS (
   SELECT
     concat(upper(trim(d.prc_eqp_id)), '-', upper(trim(d.chamber_ids))) AS station,
 
-    upper(trim(d.container_id))     AS container_id,
-    upper(trim(d.npw_wafer_id))     AS npw_wafer_id,
-    cast(d.prc_slot_id as string)   AS prc_slot_id,
+    upper(trim(d.container_id))   AS container_id,
+    upper(trim(d.npw_wafer_id))   AS npw_wafer_id,
+    cast(d.prc_slot_id as string) AS prc_slot_id,
 
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T1_OFFSET' THEN d.value END) AS t1,
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T2_OFFSET' THEN d.value END) AS t2,
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T3_OFFSET' THEN d.value END) AS t3,
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T4_OFFSET' THEN d.value END) AS t4,
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T5_OFFSET' THEN d.value END) AS t5,
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T6_OFFSET' THEN d.value END) AS t6,
-    MAX(CASE WHEN upper(trim(d.item_id)) = 'A_T7_OFFSET' THEN d.value END) AS t7
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T1_OFFSET') THEN d.value END) AS t1,
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T2_OFFSET') THEN d.value END) AS t2,
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T3_OFFSET') THEN d.value END) AS t3,
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T4_OFFSET') THEN d.value END) AS t4,
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T5_OFFSET') THEN d.value END) AS t5,
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T6_OFFSET') THEN d.value END) AS t6,
+    MAX(CASE WHEN upper(trim(d.item_id)) = concat(upper(trim(d.chamber_ids)), '_T7_OFFSET') THEN d.value END) AS t7
 
   FROM fab.m_fab_npw_dcop d
   WHERE d.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
@@ -150,6 +149,7 @@ dcop_wide AS (
     AND d.container_id IS NOT NULL
     AND d.npw_wafer_id IS NOT NULL
     AND d.prc_slot_id IS NOT NULL
+    -- ✅ offset 항목만 (A_T1_OFFSET 등)
     AND upper(trim(d.item_id)) RLIKE '^[A-Z]_T[1-7]_OFFSET$'
   GROUP BY
     concat(upper(trim(d.prc_eqp_id)), '-', upper(trim(d.chamber_ids))),
@@ -159,6 +159,7 @@ dcop_wide AS (
 )
 
 SELECT
+  e.area,
   e.station,
   e.pm_start_ts,
   e.pm_end_ts,
