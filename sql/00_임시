@@ -16,9 +16,7 @@ team_station AS (
 ),
 
 /* PM 세션 정의: PM -> LOCAL -> (IDLE or RUN)
-   pm_start_time = PM 입력시간
-   pm_end_time   = IDLE/RUN 입력시간
-   duration      = 4~10시간만
+   duration: 4~10시간
 */
 h AS (
   SELECT
@@ -49,7 +47,7 @@ pm_session AS (
     AND (unix_timestamp(t2, 'yyyyMMdd HHmmss') - unix_timestamp(t, 'yyyyMMdd HHmmss')) BETWEEN 4*3600 AND 10*3600
 ),
 
--- RS 이벤트(완성된 포인트만): 49/81/121/151
+-- RS 이벤트(완성 포인트만): 49/81/121/151
 rs_evt AS (
   SELECT
     concat(m.prc_eqp_id, '-', m.chamber_ids) AS station,
@@ -73,18 +71,20 @@ rs_evt AS (
   HAVING count(distinct m.subitem_id) IN (49,81,121,151)
 ),
 
--- PM 세션 구간 안에 들어온 RS만 남김 + test_seq 부여
+-- PM 세션 구간 안 RS + test_seq
 rs_in_pm AS (
   SELECT
     p.station,
     p.pm_start_ts,
     p.pm_end_ts,
+
     r.rs_time,
     r.container_id,
     r.npw_wafer_id,
     r.prc_slot_id,
     r.prc_ppid,
     r.n_points,
+
     ROW_NUMBER() OVER (
       PARTITION BY p.station, p.pm_start_ts, p.pm_end_ts
       ORDER BY r.rs_time
@@ -128,8 +128,13 @@ events AS (
   SELECT
     r.station,
     s.line,
+
     r.pm_start_ts,
     r.pm_end_ts,
+
+    -- ✅ pm_session_id (station + pm_start_ts)
+    concat(r.station, '|', cast(r.pm_start_ts as string)) AS pm_session_id,
+
     r.test_seq,
 
     r.rs_time,
@@ -154,5 +159,5 @@ SELECT *
 FROM events
 WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
   AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
-ORDER BY rs_time DESC
+ORDER BY pm_start_ts DESC, station, test_seq
 LIMIT 200;
