@@ -43,7 +43,7 @@ pm_filtered AS (
   WHERE dur_sec BETWEEN 4*3600 AND 10*3600
 ),
 
--- 2) RS 이벤트(= PM 세션 안에서 RS1 수행 건) + ✅ 레시피 필터 추가
+-- 2) RS 이벤트 (✅ 레시피 필터 포함)
 rs_evt AS (
   SELECT
     concat(met.prc_eqp_id, '-', met.chamber_ids) AS station,
@@ -56,7 +56,7 @@ rs_evt AS (
   FROM fab.m_fab_npw_met met
   WHERE met.item_id = 'RS1'
     AND met.subitem_id RLIKE '^S[0-9]+$'
-    AND met.prc_ppid = 'TT_RA-108030'     -- ✅ RS 레시피(PPID) 필터
+    AND met.prc_ppid = 'TT_RA-108030'
     AND met.prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
   GROUP BY
     concat(met.prc_eqp_id, '-', met.chamber_ids),
@@ -103,7 +103,7 @@ rs_event AS (
   FROM rs_in_pm
 ),
 
--- 3) DCOP 7행 -> t1~t7 피벗
+-- 3) DCOP 7행 -> t1~t7 피벗 (✅ item_id = *_OFFSET1 형식 반영)
 dcop_wide AS (
   SELECT
     concat(prc_eqp_id, '-', chamber_ids) AS station,
@@ -111,17 +111,17 @@ dcop_wide AS (
     npw_wafer_id,
     prc_slot_id,
 
-    max(case when item_id like '%_T1_OFFSET' then value end) as t1,
-    max(case when item_id like '%_T2_OFFSET' then value end) as t2,
-    max(case when item_id like '%_T3_OFFSET' then value end) as t3,
-    max(case when item_id like '%_T4_OFFSET' then value end) as t4,
-    max(case when item_id like '%_T5_OFFSET' then value end) as t5,
-    max(case when item_id like '%_T6_OFFSET' then value end) as t6,
-    max(case when item_id like '%_T7_OFFSET' then value end) as t7
+    max(case when item_id like '%_OFFSET1' then value end) as t1,
+    max(case when item_id like '%_OFFSET2' then value end) as t2,
+    max(case when item_id like '%_OFFSET3' then value end) as t3,
+    max(case when item_id like '%_OFFSET4' then value end) as t4,
+    max(case when item_id like '%_OFFSET5' then value end) as t5,
+    max(case when item_id like '%_OFFSET6' then value end) as t6,
+    max(case when item_id like '%_OFFSET7' then value end) as t7
 
   FROM fab.m_fab_npw_dcop
   WHERE prc_tkin_time BETWEEN (SELECT start_ts FROM params) AND (SELECT end_ts FROM params)
-    AND item_id RLIKE '^[A-Z]_T[1-7]_OFFSET$'
+    AND item_id RLIKE '^[A-Z]_OFFSET[1-7]$'
   GROUP BY
     concat(prc_eqp_id, '-', chamber_ids),
     container_id,
@@ -129,7 +129,6 @@ dcop_wide AS (
     prc_slot_id
 )
 
--- 4) RS 이벤트 + DCOP 조인
 SELECT
   e.station,
   e.pm_start_ts,
