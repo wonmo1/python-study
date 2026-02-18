@@ -1071,6 +1071,136 @@ for i, dt in enumerate(dt_list, 1):
 
 
 # =========================================================
+# CELL 9. rs_long_v2 생성 및 S3 적재
+#
+# 목적
+# - events(정답 키) 기준으로 RS1 포인트 데이터를 "long 형태"로 추출합니다.
+# - wide로 펼치지 않고(subitem_id, value 형태 유지) → 메모리 폭발 방지
+# - dt 파티션(= pm_start_time 날짜)별로 S3에 parquet 저장합니다.
+#
+# 핵심 포인트
+# - JOIN 키는 사용자님이 확정한 "정확 매칭" 방식 사용:
+#   station + container_id + npw_wafer_id + prc_slot_id + rs_time
+# - station 형식 통일: "MAIN-CH" (예: IMRB301-A)
+#   -> npw_met에서는 concat(prc_eqp_id,'-',chamber_ids) 로 생성
+#
+# 이번 수정사항(중요)
+# - Impala에서 '||' 연산이 AND 조건과 섞이면 STRING||BOOLEAN 타입 오류가 날 수 있어
+#   station 생성은 concat()로만 처리합니다.
+# =========================================================
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import io
+
+def upload_parquet_df(df: pd.DataFrame, bucket: str, key: str):
+    """pandas DataFrame을 parquet(snappy)로 S3 업로드"""
+    buf = io.BytesIO()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, buf, compression="snappy")
+    buf.seek(0)
+    s3.upload_fileobj(buf, bucket, key)
+    print(f"uploaded: s3://{bucket}/{key} rows={len(df)}")
+
+
+def build_keys_union_sql(ev_dt: pd.DataFrame) -> str:
+    """
+    events(특정 dt)에 있는 이벤트 키들을 Impala에서 사용할 수 있도록
+    keys CTE (UNION ALL)로 변환합니다.
+
+    keys 컬럼:
+    - station, rs_time, container_id, npw_wafer_id, prc_slot_id
+    - pm_session_id, prc_ppid, test_seq
+    """
+    rows = []
+    for r in ev_dt.itertuples(index=False):
+        station = str(r.station).replace("'", "''")
+        rs_time = pd.to_datetime(r.rs_time).strftime("%Y-%m-%d %H:%M:%S")
+        container = str(r.container_id).replace("'", "''")
+        wafer = str(r.npw_wafer_id).replace("'", "''")
+        slot = str(r.prc_slot_id).replace("'", "''")  # 문자열로 통일
+        pm_session_id = str(r.pm_session_id).replace("'", "''")
+        ppid = str(r.prc_ppid).replace("'", "''")
+        test_seq = int(r.test_seq)
+
+        rows.append(
+            "SELECT "
+            f"'{station}' AS station, "
+            f"CAST('{rs_time}' AS TIMESTAMP) AS rs_time, "
+            f"'{container}' AS container_id, "
+            f"'{wafer}' AS npw_wafer_id, "
+            f"'{slot}' AS prc_slot_id, "
+            f"'{pm_session_id}' AS pm_session_id, "
+            f"'{ppid}' AS prc_ppid, "
+            f"{test_seq} AS test_seq"
+        )
+
+    return "\nUNION ALL\n".join(rows)
+
+
+def build_rs_long_sql_from_events(ev_dt: pd.DataFrame) -> str:
+    """
+    dt 단위 events 키들을 기준으로 fab.m_fab_npw_met에서 RS1 포인트(long)를 뽑는 SQL을 만듭니다.
+    """
+    keys_sql = build_keys_union_sql(ev_dt)
+
+    sql = """
+WITH keys AS (
+{KEYS_SQL}
+)
+SELECT
+  k.station,
+  k.pm_session_id,
+  k.prc_ppid,
+  k.test_seq,
+  k.rs_time,
+  k.container_id,
+  k.npw_wafer_id,
+  k.prc_slot_id,
+  m.subitem_id,
+  m.value
+FROM fab.m_fab_npw_met m
+JOIN keys k
+  ON concat(trim(upper(m.prc_eqp_id)),'-',trim(upper(m.chamber_ids))) = k.station
+ AND CAST(m.prc_tkin_time AS TIMESTAMP) = k.rs_time
+ AND m.container_id = k.container_id
+ AND m.npw_wafer_id = k.npw_wafer_id
+ AND CAST(m.prc_slot_id AS STRING) = k.prc_slot_id
+WHERE m.item_id = 'RS1'
+  AND m.subitem_id RLIKE '^S[0-9]+$'
+""".format(KEYS_SQL=keys_sql)
+
+    return sql
+
+
+# --- dt 파티션 생성 (pm_start_time 날짜 기준) ---
+events = events.copy()
+events["pm_start_time"] = pd.to_datetime(events["pm_start_time"])
+events["dt"] = events["pm_start_time"].dt.strftime("%Y-%m-%d")
+
+dt_list = sorted(events["dt"].unique().tolist())
+print("dt_list:", dt_list, "count:", len(dt_list))
+
+
+# --- dt 별로 rs_long 추출 & S3 저장 ---
+for i, dt in enumerate(dt_list, 1):
+    ev_dt = events[events["dt"] == dt].copy()
+    if len(ev_dt) == 0:
+        continue
+
+    rs_long_sql = build_rs_long_sql_from_events(ev_dt)
+    rs_long_dt = getData(rs_long_sql)
+
+    # 편의상 dt 컬럼 추가(나중에 pandas에서 필터할 때 유용)
+    rs_long_dt["dt"] = dt
+
+    out_key = f"{S3_PREFIX}/rs_long_v2/dt={dt}/part-0.parquet"
+    upload_parquet_df(rs_long_dt, S3_BUCKET, out_key)
+
+    print(f"[{i}/{len(dt_list)}] done dt={dt}, rs_long rows={len(rs_long_dt)}")
+
+
+# =========================================================
 # CELL 10. 검증: dt 하나 로드해서 포인트 개수 분포 확인
 # - groupby observed=True로 "가짜 0그룹" 방지
 # =========================================================
