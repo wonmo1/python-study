@@ -182,7 +182,35 @@ pm AS (
   WHERE eqp_status = 'PM'
     AND s1 = 'LOCAL'
     AND s2 IN ('IDLE', 'RUN')
-    AND t
+    AND t2 IS NOT NULL
+),
+pm2 AS (
+  SELECT
+    station,
+    pm_start_time,
+    pm_end_time,
+    dur_sec,
+
+    CONCAT(
+      LPAD(CAST(FLOOR(dur_sec/3600) AS STRING), 2, '0'), ':',
+      LPAD(CAST(FLOOR((dur_sec%3600)/60) AS STRING), 2, '0')
+    ) AS dur_hhmm,
+
+    CONCAT(station,'|',CAST(pm_start_time AS STRING)) AS pm_session_id
+
+  FROM pm
+  WHERE dur_sec BETWEEN 4*3600 AND 10*3600
+)
+SELECT * FROM pm2
+ORDER BY pm_start_time DESC
+"""
+    return sql
+
+pm_sql = build_pm_sql(START_DATE, END_DATE)
+pm = getData(pm_sql)
+
+print("pm rows:", len(pm))
+pm.head(20)
 
 # =========================================================
 # CELL 7. RS 이벤트(rs_event) 생성
