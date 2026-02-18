@@ -1,2 +1,67 @@
+C:\Users\w.yang\AppData\Local\Temp\ipykernel_30200\668096043.py:12: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+  rs_long2.groupby(run_key_cols + ["rs_type","zone_id"], as_index=False)
+---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+Cell In[17], line 12
+      8 rs_long2["rs_value"] = pd.to_numeric(rs_long2["rs_value"], errors="coerce")
+      9 rs_long2 = rs_long2.dropna(subset=["rs_value"])
+     11 zone_score = (
+---> 12     rs_long2.groupby(run_key_cols + ["rs_type","zone_id"], as_index=False)
+     13             .agg(
+     14                 zone_avg=("rs_value","mean"),
+     15                 point_cnt_in_zone=("rs_value","size")
+     16             )
+     17 )
+     19 zone_score["spec_target"] = SPEC_TARGET
+     20 zone_score["spec_lsl"] = SPEC_LSL
 
-Error: ('HY000', "[HY000] [Cloudera][ImpalaODBC] (370) Query analysis error occurred during query execution: [HY000] : AnalysisException: Operands of CompoundVerticalBarExpr 'concat(trim(upper(m.prc_eqp_id)), '-') || trim(upper(m.chamber_ids)) = k.station AND CAST(m.prc_tkin_time AS TIMESTAMP) = k.rs_time AND m.container_id = k.container_id AND m.npw_wafer_id = k.npw_wafer_id AND CAST(m.prc_slot_id AS STRING) = k.prc_slot_id' should both return 'BOOLEAN' type or they should both return 'STRING' or 'VARCHAR' or 'CHAR' types, but they return types 'STRING' and 'BOOLEAN'.\n (370) (SQLExecDirectW)")
+File ~\aipforge\envs\apt_project\lib\site-packages\pandas\core\groupby\generic.py:1502, in DataFrameGroupBy.aggregate(self, func, engine, engine_kwargs, *args, **kwargs)
+   1499             result.columns = self._obj_with_exclusions.columns.copy()
+   1501 if not self.as_index:
+-> 1502     result = self._insert_inaxis_grouper(result)
+   1503     result.index = default_index(len(result))
+   1505 return result
+
+File ~\aipforge\envs\apt_project\lib\site-packages\pandas\core\groupby\groupby.py:1551, in GroupBy._insert_inaxis_grouper(self, result)
+   1549 if name not in columns:
+   1550     if in_axis:
+-> 1551         result.insert(0, name, lev)
+   1552     else:
+   1553         msg = (
+   1554             "A grouping was used that is not in the columns of the "
+   1555             "DataFrame and so was excluded from the result. This grouping "
+   1556             "will be included in a future version of pandas. Add the "
+   1557             "grouping as a column of the DataFrame to silence this warning."
+   1558         )
+
+File ~\aipforge\envs\apt_project\lib\site-packages\pandas\core\frame.py:5171, in DataFrame.insert(self, loc, column, value, allow_duplicates)
+   5168 elif isinstance(value, DataFrame):
+   5169     value = value.iloc[:, 0]
+-> 5171 value, refs = self._sanitize_column(value)
+   5172 self._mgr.insert(loc, column, value, refs=refs)
+
+File ~\aipforge\envs\apt_project\lib\site-packages\pandas\core\frame.py:5266, in DataFrame._sanitize_column(self, value)
+   5263     return _reindex_for_setitem(value, self.index)
+   5265 if is_list_like(value):
+-> 5266     com.require_length_match(value, self.index)
+   5267 arr = sanitize_array(value, self.index, copy=True, allow_2d=True)
+   5268 if (
+   5269     isinstance(value, Index)
+   5270     and value.dtype == "object"
+   (...)
+   5273     # TODO: Remove kludge in sanitize_array for string mode when enforcing
+   5274     # this deprecation
+
+File ~\aipforge\envs\apt_project\lib\site-packages\pandas\core\common.py:573, in require_length_match(data, index)
+    569 """
+    570 Check the length of data matches the length of the index.
+    571 """
+    572 if len(data) != len(index):
+--> 573     raise ValueError(
+    574         "Length of values "
+    575         f"({len(data)}) "
+    576         "does not match length of index "
+    577         f"({len(index)})"
+    578     )
+
+ValueError: Length of values (861) does not match length of index (8148)
