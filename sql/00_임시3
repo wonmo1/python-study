@@ -1,1 +1,99 @@
+# =========================================================
+# [새 셀 A] 1년치 기간 설정
+# =========================================================
+from datetime import date, timedelta
 
+END_DATE = date.today() - timedelta(days=1)     # 어제까지
+START_DATE = END_DATE - timedelta(days=365)     # 1년치
+
+print("START_DATE:", START_DATE)
+print("END_DATE  :", END_DATE)
+
+
+# =========================================================
+# [새 셀 B] 1년치 RS TEST 레시피 목록(라인/스테이션 포함)
+# - fab.m_fab_npw_met에서 RS1만 대상으로, 레시피(prc_ppid) 목록을 뽑습니다.
+# - VANTAGE만 필터(마스터 기반)
+# =========================================================
+
+start_ts = START_DATE.strftime("%Y-%m-%d") + " 00:00:00"
+end_ts   = END_DATE.strftime("%Y-%m-%d")   + " 23:59:59"
+
+sql = f"""
+WITH team_station AS (
+  SELECT DISTINCT
+    trim(upper(STATION)) AS station,   -- 예: IMRB301-A
+    area                 AS area
+  FROM fab.m_tpss_station_master
+  WHERE SUBSTR(room, -1) = '5'
+    AND (
+          STATION_NAME = 'VANTAGE-PLUS'
+       OR STATION_NAME = 'VANTAGE_PLUS'
+       OR STATION_NAME = 'VANTAGE'
+        )
+),
+rs_base AS (
+  SELECT
+    concat(trim(upper(prc_eqp_id)),'-',trim(upper(chamber_ids))) AS station,
+    prc_ppid,
+    CAST(prc_tkin_time AS TIMESTAMP) AS rs_time,
+    container_id,
+    npw_wafer_id,
+    prc_slot_id
+  FROM fab.m_fab_npw_met
+  WHERE item_id = 'RS1'
+    AND prc_tkin_time BETWEEN CAST('{start_ts}' AS TIMESTAMP) AND CAST('{end_ts}' AS TIMESTAMP)
+)
+SELECT
+  ts.area,
+  r.station,
+  r.prc_ppid,
+  COUNT(*) AS rs_rows,                           -- RS1 raw row 수(포인트 row 포함)
+  COUNT(DISTINCT CONCAT(
+        r.station,'|',CAST(r.rs_time AS STRING),'|',r.container_id,'|',r.npw_wafer_id,'|',CAST(r.prc_slot_id AS STRING)
+      )) AS rs_tests,                            -- “RS 테스트 1회” 단위(키로 묶음)
+  COUNT(DISTINCT r.npw_wafer_id) AS wafers,
+  COUNT(DISTINCT r.container_id) AS foup_cnt,
+  MIN(r.rs_time) AS first_time,
+  MAX(r.rs_time) AS last_time
+FROM rs_base r
+JOIN team_station ts
+  ON r.station = ts.station
+GROUP BY ts.area, r.station, r.prc_ppid
+ORDER BY rs_tests DESC
+"""
+
+rs_recipe_list = getData(sql)
+print("rows:", len(rs_recipe_list))
+rs_recipe_list.head(50)
+
+
+
+
+# =========================================================
+# [새 셀 C] 라인(area)별 상위 레시피 TOP 20
+# =========================================================
+
+topN = 20
+
+tmp = rs_recipe_list.copy()
+tmp = tmp.sort_values(["area","rs_tests"], ascending=[True, False])
+
+top_by_area = tmp.groupby("area", as_index=False).head(topN)
+
+top_by_area[["area","prc_ppid","rs_tests","wafers","foup_cnt","first_time","last_time"]].head(200)
+
+
+
+
+
+# =========================================================
+# [새 셀 D] station별 레시피 다양성(몇 종류 레시피를 쓰는지)
+# =========================================================
+
+station_recipe = (rs_recipe_list.groupby(["area","station"], as_index=False)
+                  .agg(n_recipe=("prc_ppid","nunique"),
+                       total_tests=("rs_tests","sum"))
+                  .sort_values(["total_tests"], ascending=False))
+
+station_recipe.head(50)
