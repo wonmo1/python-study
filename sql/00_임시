@@ -94,21 +94,17 @@ def list_parquet_keys(bucket: str, prefix: str, limit: int = 5000):
 
 s3_head_test(S3_BUCKET)
 
-
-
-
 # =========================================================
-# CELL 5. VANTAGE station 마스터 CTE
-# - 앞으로 모든 데이터는 이 station 목록으로 "우리 팀 설비만" 제한
+# CELL 5. VANTAGE station 마스터 CTE (PM/이벤트용 최소 컬럼)
+# - chamber_ids 컬럼은 여기서 빼고 진행 (지금 에러 원인)
 # =========================================================
 
 MASTER_CTE = r"""
 WITH team_station AS (
   SELECT DISTINCT
-    m.STATION      AS station,   -- 예: IMRB301-A (main+ch 형태)
-    m.ch_main      AS ch_main,   -- 예: IMRB301 (main만)
-    m.chamber_ids  AS chamber_ids, -- 예: A (또는 [A] 형태일 수도 있으니 아래에서 처리)
-    m.area         AS area
+    m.STATION AS station,   -- 예: IMRB301-A
+    m.ch_main AS ch_main,   -- 예: IMRB301 (main)
+    m.area    AS area
   FROM fab.m_tpss_station_master m
   WHERE SUBSTR(m.room, -1) = '5'
     AND (
@@ -118,7 +114,7 @@ WITH team_station AS (
         )
 )
 """
-print(MASTER_CTE[:400], "...")
+print(MASTER_CTE)
 
 
 # =========================================================
