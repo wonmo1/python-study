@@ -975,6 +975,99 @@ for i, dt in enumerate(dt_list, 1):
     print(f"[{i}/{len(dt_list)}] done dt={dt}")
 
 
+# =========================================================
+# CELL 9. rs_long_v2 생성 및 S3 적재
+# - events(정답 키) 기준으로 RS1 포인트를 long 형태로 뽑는다.
+# - wide로 펼치지 않는다(메모리 폭발 방지)
+# - dt 파티션은 pm_start_time 날짜 기준으로 저장
+# =========================================================
+
+def upload_parquet_df(df: pd.DataFrame, bucket: str, key: str):
+    buf = io.BytesIO()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, buf, compression="snappy")
+    buf.seek(0)
+    s3.upload_fileobj(buf, bucket, key)
+    print(f"uploaded: s3://{bucket}/{key} rows={len(df)}")
+
+def build_keys_union_sql(ev_dt: pd.DataFrame) -> str:
+    """
+    events의 키들을 Impala SQL keys CTE (UNION ALL)로 만든다.
+    - station, rs_time, container_id, npw_wafer_id, prc_slot_id, pm_session_id, prc_ppid, test_seq
+    """
+    rows = []
+    for r in ev_dt.itertuples(index=False):
+        station = str(r.station).replace("'", "''")
+        rs_time = pd.to_datetime(r.rs_time).strftime("%Y-%m-%d %H:%M:%S")
+        container = str(r.container_id).replace("'", "''")
+        wafer = str(r.npw_wafer_id).replace("'", "''")
+        slot = str(r.prc_slot_id).replace("'", "''")  # 문자열로 통일
+        pm_session_id = str(r.pm_session_id).replace("'", "''")
+        ppid = str(r.prc_ppid).replace("'", "''")
+        test_seq = int(r.test_seq)
+
+        rows.append(
+            "SELECT "
+            f"'{station}' AS station, "
+            f"CAST('{rs_time}' AS TIMESTAMP) AS rs_time, "
+            f"'{container}' AS container_id, "
+            f"'{wafer}' AS npw_wafer_id, "
+            f"'{slot}' AS prc_slot_id, "
+            f"'{pm_session_id}' AS pm_session_id, "
+            f"'{ppid}' AS prc_ppid, "
+            f"{test_seq} AS test_seq"
+        )
+    return "\nUNION ALL\n".join(rows)
+
+def build_rs_long_sql_from_events(ev_dt: pd.DataFrame) -> str:
+    keys_sql = build_keys_union_sql(ev_dt)
+
+    sql = """
+WITH keys AS (
+{KEYS_SQL}
+)
+SELECT
+  k.station,
+  k.pm_session_id,
+  k.prc_ppid,
+  k.test_seq,
+  k.rs_time,
+  k.container_id,
+  k.npw_wafer_id,
+  k.prc_slot_id,
+  m.subitem_id,
+  m.value
+FROM fab.m_fab_npw_met m
+JOIN keys k
+  ON trim(upper(m.prc_eqp_id)) || '-' || trim(upper(m.chamber_ids)) = k.station
+ AND CAST(m.prc_tkin_time AS TIMESTAMP) = k.rs_time
+ AND m.container_id = k.container_id
+ AND m.npw_wafer_id = k.npw_wafer_id
+ AND CAST(m.prc_slot_id AS STRING) = k.prc_slot_id
+WHERE m.item_id = 'RS1'
+  AND m.subitem_id RLIKE '^S[0-9]+$'
+""".format(KEYS_SQL=keys_sql)
+
+    return sql
+
+# dt 컬럼 생성 (pm_start_time 기준)
+events["pm_start_time"] = pd.to_datetime(events["pm_start_time"])
+events["dt"] = events["pm_start_time"].dt.strftime("%Y-%m-%d")
+
+dt_list = sorted(events["dt"].unique().tolist())
+print("dt_list:", dt_list, "count:", len(dt_list))
+
+for i, dt in enumerate(dt_list, 1):
+    ev_dt = events[events["dt"] == dt].copy()
+    rs_long_sql = build_rs_long_sql_from_events(ev_dt)
+
+    rs_long_dt = getData(rs_long_sql)
+    rs_long_dt["dt"] = dt  # 편의상 컬럼도 넣어둠
+
+    out_key = f"{S3_PREFIX}/rs_long_v2/dt={dt}/part-0.parquet"
+    upload_parquet_df(rs_long_dt, S3_BUCKET, out_key)
+
+    print(f"[{i}/{len(dt_list)}] done dt={dt}, rs_long rows={len(rs_long_dt)}")
 
 
 # =========================================================
