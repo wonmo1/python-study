@@ -1,1 +1,227 @@
 
+# =========================================================
+# NOTEBOOK 2 / CELL 1. 라이브러리/환경 준비
+# - S3에서 parquet 로드
+# - spec_df(사용자 입력)로 score 계산
+# =========================================================
+
+import pandas as pd
+import numpy as np
+import boto3
+import io
+import pyarrow.parquet as pq
+import pyarrow as pa
+
+pd.set_option("display.max_columns", 200)
+pd.set_option("display.width", 200)
+
+
+
+
+# =========================================================
+# NOTEBOOK 2 / CELL 2. S3 접속 설정
+# - Notebook 1에서 사용한 것과 동일 값 사용
+# =========================================================
+
+S3_ENDPOINT_URL = "https://YOUR_S3_ENDPOINT"
+S3_REGION = "ap-northeast-2"
+S3_ACCESS_KEY = "YOUR_ACCESS_KEY"
+S3_SECRET_KEY = "YOUR_SECRET_KEY"
+
+S3_BUCKET = "YOUR_BUCKET"
+S3_PREFIX = "ai_apt/vantage"
+
+s3 = boto3.client(
+    "s3",
+    region_name=S3_REGION,
+    endpoint_url=S3_ENDPOINT_URL,
+    aws_access_key_id=S3_ACCESS_KEY,
+    aws_secret_access_key=S3_SECRET_KEY,
+)
+
+print("S3 client ready")
+
+
+
+
+# =========================================================
+# NOTEBOOK 2 / CELL 3. S3 parquet 로드 유틸
+# - events_v1 / rs_long_v2 를 dt 단위로 읽어옵니다.
+# =========================================================
+
+def s3_read_parquet(bucket: str, key: str) -> pd.DataFrame:
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    buf = io.BytesIO(obj["Body"].read())
+    return pq.read_table(buf).to_pandas()
+
+def load_events_dt(dt: str) -> pd.DataFrame:
+    key = f"{S3_PREFIX}/events_v1/dt={dt}/part-0.parquet"
+    df = s3_read_parquet(S3_BUCKET, key)
+    df["dt"] = dt
+    return df
+
+def load_rs_long_dt(dt: str) -> pd.DataFrame:
+    key = f"{S3_PREFIX}/rs_long_v2/dt={dt}/part-0.parquet"
+    df = s3_read_parquet(S3_BUCKET, key)
+    df["dt"] = dt
+    return df
+
+
+
+
+# =========================================================
+# NOTEBOOK 2 / CELL 4. spec_df 입력(사용자 수동 입력)
+#
+# 필요 컬럼(최소):
+# - area      : 라인 (예: P23F, P1F, 15, H1 ...)
+# - prc_ppid  : 레시피
+# - subitem_id: RS 포인트 (S1, S2, ...)
+# - target    : 목표값
+# - lsl/usl   : 하한/상한
+#
+# 아래는 예시입니다. 실제 값으로 채워주세요.
+# =========================================================
+
+spec_df = pd.DataFrame([
+    {"area": "P23F", "prc_ppid": "TT_RA-108030", "subitem_id": "S1", "target": 0.0, "lsl": -1.0, "usl": 1.0},
+    {"area": "P23F", "prc_ppid": "TT_RA-108030", "subitem_id": "S2", "target": 0.0, "lsl": -1.0, "usl": 1.0},
+    {"area": "P23F", "prc_ppid": "TT_RA-108030", "subitem_id": "S3", "target": 0.0, "lsl": -1.0, "usl": 1.0},
+])
+
+# 타입 정리
+spec_df["area"] = spec_df["area"].astype(str)
+spec_df["prc_ppid"] = spec_df["prc_ppid"].astype(str)
+spec_df["subitem_id"] = spec_df["subitem_id"].astype(str)
+
+for c in ["target","lsl","usl"]:
+    spec_df[c] = pd.to_numeric(spec_df[c], errors="coerce")
+
+print("spec_df rows:", len(spec_df))
+spec_df.head(10)
+
+
+
+
+
+# =========================================================
+# NOTEBOOK 2 / CELL 5. score 계산 함수
+# - rs_long + spec_df 조인 후 z 계산
+# - 이벤트 단위로 max_z, mean_z 산출
+# =========================================================
+
+EVENT_KEY = ["pm_session_id","station","prc_ppid","test_seq","container_id","npw_wafer_id","prc_slot_id","rs_time","dt","area"]
+
+def compute_z(value, target, lsl, usl):
+    """
+    간단한 z-like score:
+    - spec in이면 0
+    - out이면 (넘친 만큼 / spec폭) 로 정규화
+    """
+    # 방어: 필수값 없으면 NaN
+    if pd.isna(value) or pd.isna(lsl) or pd.isna(usl):
+        return np.nan
+    width = usl - lsl
+    if width == 0 or pd.isna(width):
+        return np.nan
+
+    # spec-in이면 0
+    if (value >= lsl) and (value <= usl):
+        return 0.0
+
+    # out이면 벗어난 거리(상/하) / 폭
+    if value < lsl:
+        return float((lsl - value) / width)
+    else:
+        return float((value - usl) / width)
+
+def score_dt(dt: str) -> pd.DataFrame:
+    """
+    dt 하루치:
+    1) events 로드
+    2) rs_long 로드
+    3) area/recipe/subitem 기준으로 spec 조인
+    4) z 계산 후 이벤트 단위 max_z/mean_z 산출
+    """
+    ev = load_events_dt(dt)
+    rs = load_rs_long_dt(dt)
+
+    # events에서 area 가져오고, rs_long에 붙이기 위한 키(동일키가 rs_long에 존재)
+    # rs_long에는 area가 없으므로 events에서 merge
+    join_key = ["pm_session_id","station","prc_ppid","test_seq","container_id","npw_wafer_id","prc_slot_id","rs_time"]
+    ev_small = ev[join_key + ["area","dt"]].drop_duplicates()
+
+    rs2 = rs.merge(ev_small, on=join_key + ["dt"], how="left")
+
+    # spec join
+    rs3 = rs2.merge(spec_df, on=["area","prc_ppid","subitem_id"], how="left")
+
+    # z 계산
+    rs3["z"] = rs3.apply(lambda r: compute_z(r["value"], r["target"], r["lsl"], r["usl"]), axis=1)
+
+    # 이벤트 단위 집계
+    agg = (rs3.groupby(EVENT_KEY, observed=True)["z"]
+           .agg(max_z="max", mean_z="mean", n_points="count", n_spec_missing=lambda x: x.isna().sum())
+           .reset_index())
+
+    return agg
+
+print("score function ready")
+
+
+
+
+
+
+# =========================================================
+# NOTEBOOK 2 / CELL 6. dt 전체 score 계산 + S3 저장
+# - 결과 저장: score_v1/dt=YYYY-MM-DD/part-0.parquet
+# =========================================================
+
+def upload_parquet_df(df: pd.DataFrame, bucket: str, key: str):
+    buf = io.BytesIO()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, buf, compression="snappy")
+    buf.seek(0)
+    s3.upload_fileobj(buf, bucket, key)
+    print(f"uploaded: s3://{bucket}/{key} rows={len(df)}")
+
+# dt는 events 기준으로 가져오는 게 가장 안전
+# (rs_long만 보고 dt를 추출하면 events 없는 dt가 끼일 수 있음)
+sample_dt_list = sorted(spec_df["area"].unique().tolist())  # 그냥 출력용
+
+# 실제 dt 목록: S3 events_v1 prefix에서 가져오는 게 제일 정확하지만,
+# 지금은 Notebook 1에서 생성한 dt_list를 그대로 쓰는 방식이 가장 간단합니다.
+# -> dt_list를 Notebook 2로 옮겨오려면, 아래처럼 events dt를 먼저 한번 로드해서 구합니다.
+
+# 간단히: S3에서 events_v1를 리스트업하는 함수
+def list_dt_partitions(prefix: str):
+    dt_set = set()
+    token = None
+    while True:
+        kwargs = dict(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1000)
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        for c in resp.get("Contents", []):
+            k = c["Key"]
+            m = re.search(r"events_v1/dt=([0-9]{4}-[0-9]{2}-[0-9]{2})/", k)
+            if m:
+                dt_set.add(m.group(1))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return sorted(dt_set)
+
+dt_list2 = list_dt_partitions(f"{S3_PREFIX}/events_v1/")
+print("dt_list2:", dt_list2)
+
+for i, dt in enumerate(dt_list2, 1):
+    sc = score_dt(dt)
+    out_key = f"{S3_PREFIX}/score_v1/dt={dt}/part-0.parquet"
+    upload_parquet_df(sc, S3_BUCKET, out_key)
+    print(f"[{i}/{len(dt_list2)}] done dt={dt}, score rows={len(sc)}")
+
+# 샘플 확인
+if len(dt_list2) > 0:
+    sample = s3_read_parquet(S3_BUCKET, f"{S3_PREFIX}/score_v1/dt={dt_list2[0]}/part-0.parquet")
+    display(sample.head(20))
