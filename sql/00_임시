@@ -121,7 +121,68 @@ WITH team_station AS (
 print(MASTER_CTE[:400], "...")
 
 
+# =========================================================
+# CELL 6. PM 세션 테이블(pm) 생성 SQL (에러 수정 버전)
+# - Impala에서 TIMESTAMP '...' 리터럴이 파싱 에러 나는 환경 대응
+# - unix_timestamp()가 TIMESTAMP를 직접 못 받는 환경 대응 (CAST -> STRING)
+# =========================================================
 
+def build_pm_sql(start_date: date, end_date: date) -> str:
+    start_ts = f"{start_date.strftime('%Y-%m-%d')} 00:00:00"
+    end_ts   = f"{end_date.strftime('%Y-%m-%d')} 23:59:59"
+
+    sql = f"""
+{MASTER_CTE}
+, h AS (
+  SELECT
+    eqp_id AS station,
+    line_id,
+    origin_line_id,
+    eqp_status,
+    CAST(eqp_status_change_time AS TIMESTAMP) AS t,
+
+    LEAD(eqp_status, 1) OVER (
+      PARTITION BY eqp_id
+      ORDER BY CAST(eqp_status_change_time AS TIMESTAMP)
+    ) AS s1,
+    LEAD(CAST(eqp_status_change_time AS TIMESTAMP), 1) OVER (
+      PARTITION BY eqp_id
+      ORDER BY CAST(eqp_status_change_time AS TIMESTAMP)
+    ) AS t1,
+
+    LEAD(eqp_status, 2) OVER (
+      PARTITION BY eqp_id
+      ORDER BY CAST(eqp_status_change_time AS TIMESTAMP)
+    ) AS s2,
+    LEAD(CAST(eqp_status_change_time AS TIMESTAMP), 2) OVER (
+      PARTITION BY eqp_id
+      ORDER BY CAST(eqp_status_change_time AS TIMESTAMP)
+    ) AS t2
+
+  FROM mos_kh_smi.smimes_mi_eqp_hist
+  WHERE eqp_id IN (SELECT station FROM team_station)
+    AND eqp_id LIKE '%-%'
+    AND CAST(eqp_status_change_time AS TIMESTAMP) BETWEEN
+          CAST('{start_ts}' AS TIMESTAMP)
+      AND CAST('{end_ts}'   AS TIMESTAMP)
+),
+pm AS (
+  SELECT
+    station,
+    t  AS pm_start_time,
+    t2 AS pm_end_time,
+
+    -- ✅ TIMESTAMP를 unix_timestamp에 직접 넣지 않고 STRING으로 캐스팅해서 계산
+    CAST(
+      unix_timestamp(CAST(t2 AS STRING)) - unix_timestamp(CAST(t AS STRING))
+      AS BIGINT
+    ) AS dur_sec
+
+  FROM h
+  WHERE eqp_status = 'PM'
+    AND s1 = 'LOCAL'
+    AND s2 IN ('IDLE', 'RUN')
+    AND t
 
 # =========================================================
 # CELL 7. RS 이벤트(rs_event) 생성
