@@ -208,6 +208,104 @@ pm = getData(pm_sql)
 print("pm rows:", len(pm))
 pm.head(20)
 
+
+# =========================================================
+# CELL 6. PM 세션 생성 (0 row 해결 버전)
+# - eqp_status_change_time 형식: 'yyyyMMdd HHmmss' (예: 20240407 155853)
+# - CAST(... AS TIMESTAMP) 대신 unix_timestamp(string, format)으로 파싱
+# =========================================================
+
+def build_pm_sql(start_date, end_date, master_cte):
+    # eqp_status_change_time 포맷에 맞춰 start/end도 같은 문자열로 생성
+    start_str = start_date.strftime("%Y%m%d") + " 000000"
+    end_str   = end_date.strftime("%Y%m%d")   + " 235959"
+
+    sql = """
+{MASTER_CTE}
+, h AS (
+  SELECT
+    trim(upper(eqp_id)) AS station,
+    eqp_status,
+
+    -- ✅ 문자열 시간('yyyyMMdd HHmmss')을 epoch(초)로 파싱
+    unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss') AS t_ep,
+
+    LEAD(eqp_status, 1) OVER (
+      PARTITION BY trim(upper(eqp_id))
+      ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+    ) AS s1,
+
+    LEAD(unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss'), 1) OVER (
+      PARTITION BY trim(upper(eqp_id))
+      ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+    ) AS t1_ep,
+
+    LEAD(eqp_status, 2) OVER (
+      PARTITION BY trim(upper(eqp_id))
+      ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+    ) AS s2,
+
+    LEAD(unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss'), 2) OVER (
+      PARTITION BY trim(upper(eqp_id))
+      ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+    ) AS t2_ep
+
+  FROM mos_kh_smi.smimes_mi_eqp_hist
+  WHERE trim(upper(eqp_id)) IN (SELECT trim(upper(station)) FROM team_station)
+    AND eqp_id LIKE '%-%'
+    AND unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss') BETWEEN
+          unix_timestamp('{START_STR}', 'yyyyMMdd HHmmss')
+      AND unix_timestamp('{END_STR}',   'yyyyMMdd HHmmss')
+),
+pm AS (
+  SELECT
+    station,
+
+    -- 보기용 TIMESTAMP (epoch -> timestamp)
+    CAST(from_unixtime(t_ep)  AS TIMESTAMP) AS pm_start_time,
+    CAST(from_unixtime(t2_ep) AS TIMESTAMP) AS pm_end_time,
+
+    CAST(t2_ep - t_ep AS BIGINT) AS dur_sec
+  FROM h
+  WHERE eqp_status = 'PM'
+    AND s1 = 'LOCAL'
+    AND s2 IN ('IDLE', 'RUN')
+    AND t2_ep IS NOT NULL
+),
+pm2 AS (
+  SELECT
+    station,
+    pm_start_time,
+    pm_end_time,
+    dur_sec,
+    CONCAT(
+      LPAD(CAST(FLOOR(dur_sec/3600) AS STRING), 2, '0'), ':',
+      LPAD(CAST(FLOOR((dur_sec%3600)/60) AS STRING), 2, '0')
+    ) AS dur_hhmm,
+    CONCAT(station,'|',CAST(pm_start_time AS STRING)) AS pm_session_id
+  FROM pm
+  WHERE dur_sec BETWEEN 4*3600 AND 10*3600
+)
+SELECT *
+FROM pm2
+ORDER BY pm_start_time DESC
+""".format(
+        MASTER_CTE=master_cte,
+        START_STR=start_str,
+        END_STR=end_str
+    )
+
+    return sql
+
+
+pm_sql = build_pm_sql(START_DATE, END_DATE, MASTER_CTE)
+pm = getData(pm_sql)
+
+print("pm rows:", len(pm))
+pm.head(20)
+
+
+
 # =========================================================
 # CELL 7. RS 이벤트(rs_event) 생성
 # - PM 기간 내에 수행된 RS1 결과를 이벤트 단위로 만들고(test_seq 부여)
