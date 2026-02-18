@@ -1,0 +1,1 @@
+Error: ('HY000', "[HY000] [Cloudera][ImpalaODBC] (370) Query analysis error occurred during query execution: [HY000] : AnalysisException: Could not resolve column/field reference: 'm.chamber_ids'\n (370) (SQLExecDirectW)")
