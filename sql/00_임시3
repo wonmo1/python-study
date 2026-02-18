@@ -2,6 +2,7 @@
 # [새 셀 A] 1년치 기간 설정
 # =========================================================
 from datetime import date, timedelta
+from bigdataquery import getData
 
 END_DATE = date.today() - timedelta(days=1)     # 어제까지
 START_DATE = END_DATE - timedelta(days=365)     # 1년치
