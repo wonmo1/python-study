@@ -417,7 +417,98 @@ rs_event = getData(rs_event_sql)
 print("rs_event rows:", len(rs_event))
 rs_event.head(50)
 
+# =========================================================
+# CELL 7. RS EVENT 생성 (PM 구간 매칭, epoch 기준 통일)
+# =========================================================
 
+def build_rs_event_sql(start_date, end_date, master_cte):
+    start_str = start_date.strftime("%Y-%m-%d") + " 00:00:00"
+    end_str   = end_date.strftime("%Y-%m-%d")   + " 23:59:59"
+
+    sql = """
+{MASTER_CTE}
+, rs_raw AS (
+  SELECT
+    trim(upper(prc_eqp_id)) || '-' || trim(upper(chamber_ids)) AS station,
+    container_id,
+    npw_wafer_id,
+    prc_slot_id,
+    prc_ppid,
+    unix_timestamp(prc_tkin_time) AS rs_ep
+  FROM fab.m_fab_npw_met
+  WHERE item_id = 'RS1'
+    AND prc_tkin_time BETWEEN
+        CAST('{START_STR}' AS TIMESTAMP)
+        AND CAST('{END_STR}' AS TIMESTAMP)
+),
+rs_event AS (
+  SELECT
+    r.station,
+    r.container_id,
+    r.npw_wafer_id,
+    r.prc_slot_id,
+    r.prc_ppid,
+    CAST(from_unixtime(r.rs_ep) AS TIMESTAMP) AS rs_time,
+    r.rs_ep,
+    p.pm_session_id,
+    p.pm_start_time,
+    p.pm_end_time,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.pm_session_id, r.station, r.prc_ppid
+      ORDER BY r.rs_ep
+    ) AS test_seq
+  FROM rs_raw r
+  JOIN (
+        {MASTER_CTE}
+        , h AS (
+            SELECT
+              trim(upper(eqp_id)) AS station,
+              eqp_status,
+              unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss') AS t_ep,
+              LEAD(eqp_status,1) OVER (
+                  PARTITION BY trim(upper(eqp_id))
+                  ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+              ) AS s1,
+              LEAD(unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss'),2) OVER (
+                  PARTITION BY trim(upper(eqp_id))
+                  ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+              ) AS t2_ep
+            FROM mos_kh_smi.smimes_mi_eqp_hist
+            WHERE trim(upper(eqp_id)) IN (SELECT trim(upper(station)) FROM team_station)
+              AND eqp_id LIKE '%-%'
+        )
+        SELECT
+            station,
+            CAST(from_unixtime(t_ep) AS TIMESTAMP) AS pm_start_time,
+            CAST(from_unixtime(t2_ep) AS TIMESTAMP) AS pm_end_time,
+            CONCAT(station,'|',CAST(from_unixtime(t_ep) AS STRING)) AS pm_session_id,
+            t_ep,
+            t2_ep
+        FROM h
+        WHERE eqp_status='PM'
+          AND s1='LOCAL'
+          AND t2_ep IS NOT NULL
+      ) p
+    ON r.station = p.station
+   AND r.rs_ep BETWEEN p.t_ep AND p.t2_ep
+)
+SELECT *
+FROM rs_event
+ORDER BY rs_time DESC
+""".format(
+        MASTER_CTE=master_cte,
+        START_STR=start_str,
+        END_STR=end_str
+    )
+
+    return sql
+
+
+rs_sql = build_rs_event_sql(START_DATE, END_DATE, MASTER_CTE)
+rs_event = getData(rs_sql)
+
+print("rs_event rows:", len(rs_event))
+rs_event.head(20)
 
 
 # =========================================================
