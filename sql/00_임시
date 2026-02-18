@@ -1226,3 +1226,44 @@ vc = (rs_check.groupby(key_cols_fixed, observed=True)["subitem_id"]
 print("check_dt:", check_dt)
 print(vc)
 rs_check.head(20)
+
+
+
+# =========================================================
+# CELL 10. 검증: rs_long_v2(dt)를 S3에서 읽어 포인트 개수 분포 확인
+#
+# 목적
+# - 이벤트(= test 1회)당 subitem_id(S숫자) 개수가 몇 개인지 확인
+# - 기대값: 49 / 81 / 121 / 151 (라인/레시피별 RS 포인트 셋)
+# - 0이 섞이면: join 누락/키 불일치/필터 문제 가능성이 큼
+# =========================================================
+
+import io
+import pyarrow.parquet as pq
+
+def load_rs_long_v2_dt_from_s3(dt: str) -> pd.DataFrame:
+    key = f"{S3_PREFIX}/rs_long_v2/dt={dt}/part-0.parquet"
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    buf = io.BytesIO(obj["Body"].read())
+    df = pq.read_table(buf).to_pandas()
+    df["dt"] = dt
+    return df
+
+check_dt = dt_list[0]
+rs_check = load_rs_long_v2_dt_from_s3(check_dt)
+
+key_cols = [
+    "pm_session_id","prc_ppid","test_seq","station",
+    "container_id","npw_wafer_id","prc_slot_id","rs_time"
+]
+
+vc = (rs_check.groupby(key_cols, observed=True)["subitem_id"]
+      .nunique()
+      .value_counts()
+      .sort_index())
+
+print("check_dt:", check_dt)
+print("point-count distribution:")
+print(vc)
+
+rs_check.head(30)
