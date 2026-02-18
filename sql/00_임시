@@ -681,7 +681,203 @@ print("events rows:", len(events))
 events.head(100)
 
 
+# =========================================================
+# CELL 8. events 생성 (RS 이벤트 + DCOP tempoffset 피벗)
+# 목적:
+# - rs_event(=PM 세션 내 RS 테스트 이벤트 1행) 기준으로
+#   DCOP 테이블에서 tempoffset(t1~t7)을 붙여서 events(학습 메타 테이블) 완성
+#
+# 중요한 전제:
+# - DCOP의 item_id는 'A_T1_OFFSET' ~ 'A_T7_OFFSET' (A/B는 챔버)
+# - station 형식은 rs_event와 동일하게: "MAIN-CH" (예: IMRB301-A)
+# - 시간은 epoch로 통일해서 조인 정확도를 높임
+#
+# 결과:
+# - events: 1행 = (pm_session_id, station, rs_time, recipe, test_seq, line(area), t1~t7)
+# - t1~t7이 하나라도 NULL이면 제거(사용자님 요청)
+# =========================================================
 
+def build_events_sql(start_date, end_date, master_cte, only_ppid=None):
+    start_ts = start_date.strftime("%Y-%m-%d") + " 00:00:00"
+    end_ts   = end_date.strftime("%Y-%m-%d")   + " 23:59:59"
+
+    ppid_filter = ""
+    if only_ppid:
+        ppid_filter = " AND r.prc_ppid = '{PPID}' ".format(PPID=only_ppid.replace("'", "''"))
+
+    sql = """
+{MASTER_CTE}
+
+-- 1) rs_event를 다시 SQL에서 생성 (CELL7과 동일 개념)
+, pm AS (
+  SELECT
+    station,
+    t_ep,
+    t2_ep,
+    CAST(from_unixtime(t_ep)  AS TIMESTAMP) AS pm_start_time,
+    CAST(from_unixtime(t2_ep) AS TIMESTAMP) AS pm_end_time,
+    CONCAT(station,'|',CAST(from_unixtime(t_ep) AS STRING)) AS pm_session_id
+  FROM (
+    SELECT
+      trim(upper(eqp_id)) AS station,
+      eqp_status,
+      unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss') AS t_ep,
+      LEAD(eqp_status, 1) OVER (
+        PARTITION BY trim(upper(eqp_id))
+        ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+      ) AS s1,
+      LEAD(eqp_status, 2) OVER (
+        PARTITION BY trim(upper(eqp_id))
+        ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+      ) AS s2,
+      LEAD(unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss'), 2) OVER (
+        PARTITION BY trim(upper(eqp_id))
+        ORDER BY unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss')
+      ) AS t2_ep
+    FROM mos_kh_smi.smimes_mi_eqp_hist
+    WHERE trim(upper(eqp_id)) IN (SELECT trim(upper(station)) FROM team_station)
+      AND eqp_id LIKE '%-%'
+      AND unix_timestamp(eqp_status_change_time, 'yyyyMMdd HHmmss') BETWEEN
+            unix_timestamp('{PM_START_STR}', 'yyyyMMdd HHmmss')
+        AND unix_timestamp('{PM_END_STR}',   'yyyyMMdd HHmmss')
+  ) x
+  WHERE eqp_status='PM' AND s1='LOCAL' AND s2 IN ('IDLE','RUN') AND t2_ep IS NOT NULL
+),
+pm2 AS (
+  SELECT
+    station, t_ep, t2_ep, pm_start_time, pm_end_time, pm_session_id,
+    CAST(t2_ep - t_ep AS BIGINT) AS dur_sec
+  FROM pm
+  WHERE (t2_ep - t_ep) BETWEEN 4*3600 AND 10*3600
+),
+rs_raw_event AS (
+  SELECT DISTINCT
+    trim(upper(prc_eqp_id)) || '-' || trim(upper(chamber_ids)) AS station,
+    container_id,
+    npw_wafer_id,
+    prc_slot_id,
+    prc_ppid,
+    unix_timestamp(prc_tkin_time) AS rs_ep
+  FROM fab.m_fab_npw_met
+  WHERE item_id='RS1'
+    AND prc_tkin_time BETWEEN CAST('{RS_START_TS}' AS TIMESTAMP) AND CAST('{RS_END_TS}' AS TIMESTAMP)
+),
+rs_event AS (
+  SELECT
+    r.station,
+    p.pm_session_id,
+    p.pm_start_time,
+    p.pm_end_time,
+    r.container_id,
+    r.npw_wafer_id,
+    r.prc_slot_id,
+    CAST(from_unixtime(r.rs_ep) AS TIMESTAMP) AS rs_time,
+    r.rs_ep,
+    r.prc_ppid,
+    -- 같은 rs_time + 같은 recipe는 같은 회차로 묶기: DENSE_RANK 권장
+    DENSE_RANK() OVER (
+      PARTITION BY p.pm_session_id, r.station, r.prc_ppid
+      ORDER BY r.rs_ep
+    ) AS test_seq
+  FROM rs_raw_event r
+  JOIN pm2 p
+    ON r.station = p.station
+   AND r.rs_ep BETWEEN p.t_ep AND p.t2_ep
+  WHERE 1=1 {PPID_FILTER}
+),
+
+-- 2) DCOP raw: station, tk_ep(=prc_tkin_time), item_id, value
+dcop_raw AS (
+  SELECT
+    trim(upper(prc_eqp_id)) || '-' || trim(upper(chamber_ids)) AS station,
+    container_id,
+    npw_wafer_id,
+    prc_slot_id,
+    unix_timestamp(prc_tkin_time) AS tk_ep,
+    item_id,
+    value
+  FROM fab.m_fab_npw_dcop
+  WHERE prc_tkin_time BETWEEN CAST('{RS_START_TS}' AS TIMESTAMP) AND CAST('{RS_END_TS}' AS TIMESTAMP)
+),
+
+-- 3) rs_event 키로 DCOP를 붙여 pivot(t1~t7)
+dcop_pivot AS (
+  SELECT
+    r.pm_session_id,
+    r.station,
+    r.container_id,
+    r.npw_wafer_id,
+    r.prc_slot_id,
+    r.rs_ep,
+
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T1_OFFSET') THEN d.value END) AS t1,
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T2_OFFSET') THEN d.value END) AS t2,
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T3_OFFSET') THEN d.value END) AS t3,
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T4_OFFSET') THEN d.value END) AS t4,
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T5_OFFSET') THEN d.value END) AS t5,
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T6_OFFSET') THEN d.value END) AS t6,
+    MAX(CASE WHEN d.item_id = concat(split_part(r.station,'-',2),'_T7_OFFSET') THEN d.value END) AS t7
+
+  FROM rs_event r
+  LEFT JOIN dcop_raw d
+    ON d.station      = r.station
+   AND d.container_id = r.container_id
+   AND d.npw_wafer_id = r.npw_wafer_id
+   AND d.prc_slot_id  = r.prc_slot_id
+   AND d.tk_ep        = r.rs_ep
+  GROUP BY
+    r.pm_session_id, r.station, r.container_id, r.npw_wafer_id, r.prc_slot_id, r.rs_ep
+),
+
+-- 4) 최종 events: line(area)도 붙임 (마스터에서)
+final AS (
+  SELECT
+    r.pm_session_id,
+    r.pm_start_time,
+    r.pm_end_time,
+    r.station,
+    ts.area AS area,  -- 라인 정보
+    r.container_id,
+    r.npw_wafer_id,
+    r.prc_slot_id,
+    r.rs_time,
+    r.prc_ppid,
+    r.test_seq,
+    p.t1, p.t2, p.t3, p.t4, p.t5, p.t6, p.t7
+  FROM rs_event r
+  LEFT JOIN team_station ts
+    ON trim(upper(ts.station)) = trim(upper(r.station))
+  LEFT JOIN dcop_pivot p
+    ON p.pm_session_id = r.pm_session_id
+   AND p.station = r.station
+   AND p.container_id = r.container_id
+   AND p.npw_wafer_id = r.npw_wafer_id
+   AND p.prc_slot_id  = r.prc_slot_id
+   AND p.rs_ep        = r.rs_ep
+)
+
+SELECT *
+FROM final
+WHERE t1 IS NOT NULL AND t2 IS NOT NULL AND t3 IS NOT NULL
+  AND t4 IS NOT NULL AND t5 IS NOT NULL AND t6 IS NOT NULL AND t7 IS NOT NULL
+ORDER BY rs_time DESC
+""".format(
+        MASTER_CTE=master_cte,
+        PM_START_STR=start_date.strftime("%Y%m%d") + " 000000",
+        PM_END_STR=end_date.strftime("%Y%m%d") + " 235959",
+        RS_START_TS=start_ts,
+        RS_END_TS=end_ts,
+        PPID_FILTER=ppid_filter
+    )
+
+    return sql
+
+
+events_sql = build_events_sql(START_DATE, END_DATE, MASTER_CTE, ONLY_PPID)
+events = getData(events_sql)
+
+print("events rows:", len(events))
+events.head(50)
 
 # =========================================================
 # CELL 9. rs_long_v2 생성/적재
